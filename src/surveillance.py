@@ -21,7 +21,7 @@ if not NTFY_TOPIC:
     exit()
 
 # --- CONFIGURATION ---
-SHOW_VIDEO_FEED = True 
+SHOW_VIDEO_FEED = False 
 MIN_AREA_SIZE = 1000 
 RECORD_EXTENSION = 3 
 LIGHT_CHANGE_THRESHOLD = 40.0  # Percentage of screen change to trigger light suppression
