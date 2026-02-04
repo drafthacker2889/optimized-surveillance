@@ -6,6 +6,7 @@ import winsound
 import os
 import requests
 from dotenv import load_dotenv
+import surveillance_core  # <--- Ensure your compiled Rust library is in the path
 
 # --- LOAD SECRETS ---
 load_dotenv() 
@@ -21,12 +22,12 @@ if not NTFY_TOPIC:
     exit()
 
 # --- CONFIGURATION ---
-SHOW_VIDEO_FEED = True         # Set to False to run headless (saves more CPU)
-MIN_AREA_SIZE = 1000           # Minimum size of motion to trigger alert
-RECORD_EXTENSION = 3           # Seconds to continue recording after motion stops
-LIGHT_CHANGE_THRESHOLD = 40.0  # Percentage of screen change to trigger light suppression
-LEARNING_RATE = 0.05           # Speed at which the background model adapts
-TARGET_WIDTH = 500             # Width for optimization processing
+SHOW_VIDEO_FEED = False          # Toggle visual feedback
+MIN_AREA_SIZE = 1000            # Minimum size of motion to trigger alert
+RECORD_EXTENSION = 3            # Seconds to continue recording after motion stops
+LIGHT_CHANGE_THRESHOLD = 40.0   # Percentage of screen change to trigger light suppression
+LEARNING_RATE = 0.05            # Speed at which the background model adapts
+TARGET_WIDTH = 500              # Width for optimization processing
 
 class SurveillanceSystem:
     def __init__(self):
@@ -45,7 +46,7 @@ class SurveillanceSystem:
         self.last_alert_time = 0 
         self.alert_cooldown = 30 
         
-        print(f"System Armed.")
+        print(f"System Armed (Hybrid Rust/Python Architecture).")
         print(f"Notifications: ntfy.sh/{NTFY_TOPIC}")
         print(f"Optimized Mode: {'ON' if not SHOW_VIDEO_FEED else 'OFF'}")
 
@@ -134,14 +135,13 @@ class SurveillanceSystem:
                     break
 
                 # --- OPTIMIZATION: DOWNSCALING ---
-                # Calculations on a smaller frame to save CPU
                 height, width = frame.shape[:2]
                 scale_ratio = width / float(TARGET_WIDTH)
                 target_height = int(height / scale_ratio)
                 
                 small_frame = cv2.resize(frame, (TARGET_WIDTH, target_height))
 
-                # Process the SMALL frame
+                # Process the SMALL frame for motion math
                 gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
                 gray = cv2.GaussianBlur(gray, (21, 21), 0)
 
@@ -150,43 +150,48 @@ class SurveillanceSystem:
                     self.avg_frame = gray.astype("float")
                     continue
 
-                # 1. Update background model
+                # Update the background model
                 cv2.accumulateWeighted(gray, self.avg_frame, LEARNING_RATE)
-                frame_delta = cv2.absdiff(gray, cv2.convertScaleAbs(self.avg_frame))
+                bg_uint8 = cv2.convertScaleAbs(self.avg_frame)
+
+                # --- HYBRID RUST ENGINE ---
+                # Rust calculates the pixel difference score to determine if 
+                # we even need to bother with contour calculations.
+                change_percentage = surveillance_core.calculate_motion_score(gray, bg_uint8, 25)
 
                 # 2. Thresholding and Light Suppression
-                thresh_full = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
-                changed_pixels = cv2.countNonZero(thresh_full)
-                total_pixels = small_frame.shape[0] * small_frame.shape[1]
-                change_percentage = (changed_pixels / total_pixels) * 100
-
                 if change_percentage > LIGHT_CHANGE_THRESHOLD:
                     print(f"[INFO] Light change ({change_percentage:.1f}%). Resetting.")
                     self.avg_frame = gray.astype("float")
-                    if self.recording and (time.time() - self.last_motion_time > RECORD_EXTENSION):
+                    if self.recording:
                         self.stop_recording()
                     continue
 
-                # 3. Motion Detection
-                thresh = cv2.dilate(thresh_full, None, iterations=2)
-                contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
+                # 3. Motion Detection Gate
                 motion_detected = False
-                for contour in contours:
-                    # Adjust minimum area for the smaller resolution
-                    if cv2.contourArea(contour) < (MIN_AREA_SIZE / scale_ratio):
-                        continue
-                    
-                    motion_detected = True
-                    
-                    if SHOW_VIDEO_FEED:
-                        (x, y, w, h) = cv2.boundingRect(contour)
-                        # Scale coordinates back up for drawing on high-res frame
-                        big_x = int(x * scale_ratio)
-                        big_y = int(y * scale_ratio)
-                        big_w = int(w * scale_ratio)
-                        big_h = int(h * scale_ratio)
-                        cv2.rectangle(frame, (big_x, big_y), (big_x+big_w, big_y+big_h), (0, 255, 0), 3)
+                
+                # Only perform heavy contour analysis if Rust detects > 0.1% change
+                if change_percentage > 0.1:
+                    frame_delta = cv2.absdiff(gray, bg_uint8)
+                    thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
+                    thresh = cv2.dilate(thresh, None, iterations=2)
+                    contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                    for contour in contours:
+                        # Adjust minimum area for the smaller resolution
+                        if cv2.contourArea(contour) < (MIN_AREA_SIZE / scale_ratio):
+                            continue
+                        
+                        motion_detected = True
+                        
+                        if SHOW_VIDEO_FEED:
+                            (x, y, w, h) = cv2.boundingRect(contour)
+                            # Scale coordinates back up for drawing on high-res frame
+                            big_x = int(x * scale_ratio)
+                            big_y = int(y * scale_ratio)
+                            big_w = int(w * scale_ratio)
+                            big_h = int(h * scale_ratio)
+                            cv2.rectangle(frame, (big_x, big_y), (big_x+big_w, big_y+big_h), (0, 255, 0), 3)
 
                 # 4. State Management
                 if motion_detected:
@@ -200,7 +205,8 @@ class SurveillanceSystem:
 
                 # 5. UI
                 if SHOW_VIDEO_FEED:
-                    cv2.putText(frame, f"Opt: {scale_ratio:.1f}x Change: {change_percentage:.1f}%", (10, 20), 
+                    status_text = f"Rust Hybrid Engine | Motion: {change_percentage:.1f}%"
+                    cv2.putText(frame, status_text, (10, 20), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
                     cv2.imshow("Surveillance Feed", frame)
                     if cv2.waitKey(1) == ord('q'):

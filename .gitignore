@@ -2,4 +2,4 @@
 recordings/
 __pycache__/
 venv/
-.env
+.env"target/" 
