@@ -4,6 +4,21 @@ from datetime import datetime
 import threading
 import winsound
 import os
+import requests
+from dotenv import load_dotenv
+
+# --- LOAD SECRETS ---
+load_dotenv() 
+
+# Fetch the secret from the .env file
+NTFY_TOPIC = os.getenv("NTFY_TOPIC")
+
+if not NTFY_TOPIC:
+    print("---------------------------------------------------")
+    print("CRITICAL ERROR: .env file not found or NTFY_TOPIC is missing!")
+    print("Please create a .env file with: NTFY_TOPIC=your_secret_topic")
+    print("---------------------------------------------------")
+    exit()
 
 # --- CONFIGURATION ---
 SHOW_VIDEO_FEED = True 
@@ -25,19 +40,63 @@ class SurveillanceSystem:
         self.out = None
         self.last_motion_time = None
         
-        print(f"System Armed. Optimized Mode: {'ON' if not SHOW_VIDEO_FEED else 'OFF'}")
+        # Rate limit alerts so you don't get spammed
+        self.last_alert_time = 0 
+        self.alert_cooldown = 30 
+        
+        print(f"System Armed.")
+        print(f"Notifications: ntfy.sh/{NTFY_TOPIC}")
+        print(f"Optimized Mode: {'ON' if not SHOW_VIDEO_FEED else 'OFF'}")
 
-    def alert_user(self):
+    def alert_user_local(self):
         """Triggers a non-blocking beep alert."""
         def sound_alarm():
-            winsound.Beep(2500, 1000) 
+            # winsound is Windows specific
+            try:
+                winsound.Beep(2500, 1000)
+            except Exception:
+                pass 
         
-        if hasattr(winsound, "Beep"):
-            t = threading.Thread(target=sound_alarm)
-            t.daemon = True
-            t.start()
-        else:
-            print("ALERT: Motion Detected!")
+        t = threading.Thread(target=sound_alarm)
+        t.daemon = True
+        t.start()
+
+    def send_ntfy_alert(self, frame):
+        """Encodes the frame as a JPG and sends it to phone via NTFY."""
+        current_time = time.time()
+        
+        # Cooldown check
+        if current_time - self.last_alert_time < self.alert_cooldown:
+            return
+
+        self.last_alert_time = current_time
+
+        def _worker():
+            try:
+                # Compress image to JPG
+                _, img_encoded = cv2.imencode('.jpg', frame)
+                data = img_encoded.tobytes()
+
+                print(f"[ALERT] Sending notification to ntfy.sh/{NTFY_TOPIC}...")
+                response = requests.put(
+                    f"https://ntfy.sh/{NTFY_TOPIC}",
+                    data=data,
+                    headers={
+                        "Title": "Intruder Detected!",
+                        "Priority": "high",
+                        "Tags": "warning,camera"
+                    }
+                )
+                if response.status_code == 200:
+                    print("[ALERT] Notification sent successfully!")
+                else:
+                    print(f"[ALERT] Failed to send: {response.text}")
+            except Exception as e:
+                print(f"[ALERT] Error sending notification: {e}")
+
+        t = threading.Thread(target=_worker)
+        t.daemon = True
+        t.start()
 
     def start_recording(self, frame):
         """Initializes the VideoWriter and starts saving frames."""
@@ -50,14 +109,15 @@ class SurveillanceSystem:
             
             filename = os.path.join("recordings", f"Intruder_{timestamp}.mp4")
             
-            # Using mp4v codec for .mp4 files
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            # Assuming standard 640x480; frame.shape can be used for dynamic sizing
             height, width = frame.shape[:2]
             self.out = cv2.VideoWriter(filename, fourcc, 20.0, (width, height))
             
             print(f"[REC] Started recording: {filename}")
-            self.alert_user()
+            
+            # Trigger both local and remote alerts
+            self.alert_user_local()
+            self.send_ntfy_alert(frame)
 
     def stop_recording(self):
         """Releases the VideoWriter and stops recording."""
@@ -76,37 +136,33 @@ class SurveillanceSystem:
                     print("[ERROR] Could not read from webcam.")
                     break
 
-                # Pre-processing: Convert to grayscale and blur
+                # Pre-processing
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 gray = cv2.GaussianBlur(gray, (21, 21), 0)
 
-                # Initialize background model if it doesn't exist
                 if self.avg_frame is None:
                     print("[INFO] Starting background model...")
                     self.avg_frame = gray.astype("float")
                     continue
 
-                # 1. Update the background model (Weighted Average)
+                # 1. Update background model
                 cv2.accumulateWeighted(gray, self.avg_frame, LEARNING_RATE)
-                
-                # 2. Compare current frame to the running background average
                 frame_delta = cv2.absdiff(gray, cv2.convertScaleAbs(self.avg_frame))
 
-                # 3. Sudden Light Suppression check
+                # 2. Thresholding and Light Suppression
                 thresh_full = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
                 changed_pixels = cv2.countNonZero(thresh_full)
                 total_pixels = frame.shape[0] * frame.shape[1]
                 change_percentage = (changed_pixels / total_pixels) * 100
 
                 if change_percentage > LIGHT_CHANGE_THRESHOLD:
-                    print(f"[INFO] Light change detected ({change_percentage:.1f}%). Resetting background.")
+                    print(f"[INFO] Light change ({change_percentage:.1f}%). Resetting.")
                     self.avg_frame = gray.astype("float")
-                    # Stop recording if it was a false alarm from light
                     if self.recording and (time.time() - self.last_motion_time > RECORD_EXTENSION):
                         self.stop_recording()
                     continue
 
-                # 4. Standard Motion Logic (Dilation and Contours)
+                # 3. Motion Detection
                 thresh = cv2.dilate(thresh_full, None, iterations=2)
                 contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -120,29 +176,25 @@ class SurveillanceSystem:
                         (x, y, w, h) = cv2.boundingRect(contour)
                         cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 3)
 
-                # 5. Recording state management
+                # 4. State Management
                 if motion_detected:
                     self.last_motion_time = time.time()
                     self.start_recording(frame)
                 
                 if self.recording:
                     self.out.write(frame)
-                    # Check if motion has stopped for longer than the extension time
                     if time.time() - self.last_motion_time > RECORD_EXTENSION:
                         self.stop_recording()
 
-                # 6. UI Rendering
+                # 5. UI
                 if SHOW_VIDEO_FEED:
                     cv2.putText(frame, f"Change: {change_percentage:.1f}%", (10, 20), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
                     cv2.imshow("Surveillance Feed", frame)
-                    
-                    key = cv2.waitKey(1)
-                    if key == ord('q'):
+                    if cv2.waitKey(1) == ord('q'):
                         break
         
         finally:
-            # Cleanup resources
             if self.recording:
                 self.stop_recording()
             self.video.release()
