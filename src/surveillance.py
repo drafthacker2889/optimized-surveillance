@@ -21,11 +21,12 @@ if not NTFY_TOPIC:
     exit()
 
 # --- CONFIGURATION ---
-SHOW_VIDEO_FEED = False 
-MIN_AREA_SIZE = 1000 
-RECORD_EXTENSION = 3 
+SHOW_VIDEO_FEED = True         # Set to False to run headless (saves more CPU)
+MIN_AREA_SIZE = 1000           # Minimum size of motion to trigger alert
+RECORD_EXTENSION = 3           # Seconds to continue recording after motion stops
 LIGHT_CHANGE_THRESHOLD = 40.0  # Percentage of screen change to trigger light suppression
 LEARNING_RATE = 0.05           # Speed at which the background model adapts
+TARGET_WIDTH = 500             # Width for optimization processing
 
 class SurveillanceSystem:
     def __init__(self):
@@ -51,7 +52,6 @@ class SurveillanceSystem:
     def alert_user_local(self):
         """Triggers a non-blocking beep alert."""
         def sound_alarm():
-            # winsound is Windows specific
             try:
                 winsound.Beep(2500, 1000)
             except Exception:
@@ -65,7 +65,6 @@ class SurveillanceSystem:
         """Encodes the frame as a JPG and sends it to phone via NTFY."""
         current_time = time.time()
         
-        # Cooldown check
         if current_time - self.last_alert_time < self.alert_cooldown:
             return
 
@@ -73,7 +72,6 @@ class SurveillanceSystem:
 
         def _worker():
             try:
-                # Compress image to JPG
                 _, img_encoded = cv2.imencode('.jpg', frame)
                 data = img_encoded.tobytes()
 
@@ -115,7 +113,6 @@ class SurveillanceSystem:
             
             print(f"[REC] Started recording: {filename}")
             
-            # Trigger both local and remote alerts
             self.alert_user_local()
             self.send_ntfy_alert(frame)
 
@@ -136,8 +133,16 @@ class SurveillanceSystem:
                     print("[ERROR] Could not read from webcam.")
                     break
 
-                # Pre-processing
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                # --- OPTIMIZATION: DOWNSCALING ---
+                # Calculations on a smaller frame to save CPU
+                height, width = frame.shape[:2]
+                scale_ratio = width / float(TARGET_WIDTH)
+                target_height = int(height / scale_ratio)
+                
+                small_frame = cv2.resize(frame, (TARGET_WIDTH, target_height))
+
+                # Process the SMALL frame
+                gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
                 gray = cv2.GaussianBlur(gray, (21, 21), 0)
 
                 if self.avg_frame is None:
@@ -152,7 +157,7 @@ class SurveillanceSystem:
                 # 2. Thresholding and Light Suppression
                 thresh_full = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
                 changed_pixels = cv2.countNonZero(thresh_full)
-                total_pixels = frame.shape[0] * frame.shape[1]
+                total_pixels = small_frame.shape[0] * small_frame.shape[1]
                 change_percentage = (changed_pixels / total_pixels) * 100
 
                 if change_percentage > LIGHT_CHANGE_THRESHOLD:
@@ -168,13 +173,20 @@ class SurveillanceSystem:
 
                 motion_detected = False
                 for contour in contours:
-                    if cv2.contourArea(contour) < MIN_AREA_SIZE:
+                    # Adjust minimum area for the smaller resolution
+                    if cv2.contourArea(contour) < (MIN_AREA_SIZE / scale_ratio):
                         continue
                     
                     motion_detected = True
+                    
                     if SHOW_VIDEO_FEED:
                         (x, y, w, h) = cv2.boundingRect(contour)
-                        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 3)
+                        # Scale coordinates back up for drawing on high-res frame
+                        big_x = int(x * scale_ratio)
+                        big_y = int(y * scale_ratio)
+                        big_w = int(w * scale_ratio)
+                        big_h = int(h * scale_ratio)
+                        cv2.rectangle(frame, (big_x, big_y), (big_x+big_w, big_y+big_h), (0, 255, 0), 3)
 
                 # 4. State Management
                 if motion_detected:
@@ -188,7 +200,7 @@ class SurveillanceSystem:
 
                 # 5. UI
                 if SHOW_VIDEO_FEED:
-                    cv2.putText(frame, f"Change: {change_percentage:.1f}%", (10, 20), 
+                    cv2.putText(frame, f"Opt: {scale_ratio:.1f}x Change: {change_percentage:.1f}%", (10, 20), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
                     cv2.imshow("Surveillance Feed", frame)
                     if cv2.waitKey(1) == ord('q'):
