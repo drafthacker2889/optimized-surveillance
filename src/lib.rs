@@ -1,29 +1,41 @@
 use pyo3::prelude::*;
-use numpy::PyReadonlyArray2;
+use numpy::{PyReadonlyArray2, PyReadwriteArray2}; // <--- IMPORT ReadWrite
 
+/// FUSED KERNEL: Updates background AND calculates motion in a single CPU pass.
+/// Complexity: O(N) | Memory Ops: 50% Reduction vs Python
 #[pyfunction]
-fn calculate_motion_score(
+fn update_and_score(
     current_frame: PyReadonlyArray2<u8>,
-    background_frame: PyReadonlyArray2<u8>,
+    mut background_model: PyReadwriteArray2<f32>, // Mutable: We write to this
+    learning_rate: f32,
     threshold: u8,
 ) -> PyResult<f32> {
     let current = current_frame.as_array();
-    let background = background_frame.as_array();
+    let mut bg = background_model.as_array_mut(); // Get mutable reference
 
-    if current.shape() != background.shape() {
+    if current.shape() != bg.shape() {
         return Ok(0.0);
     }
 
     let mut changed_pixels = 0;
     let total_pixels = current.len();
 
-    // zip allows us to iterate two arrays at the same time
-    for (p1, p2) in current.iter().zip(background.iter()) {
-        // Rust allows subtracting references (&u8 - &u8) automatically
-        // so 'diff' becomes a standard u8 number here.
-        let diff = if p1 > p2 { p1 - p2 } else { p2 - p1 };
+    // The Magic: We iterate (Zip) over both images at the exact same time.
+    // This keeps the CPU cache hot and prevents "cache misses".
+    for (p_curr, p_bg) in current.iter().zip(bg.iter_mut()) {
+        let pixel_val = *p_curr as f32;
+
+        // 1. UPDATE BACKGROUND MODEL (The Math)
+        // Formula: avg = (avg * (1 - alpha)) + (current * alpha)
+        *p_bg = (*p_bg * (1.0 - learning_rate)) + (pixel_val * learning_rate);
+
+        // 2. CALCULATE MOTION SCORE
+        // We cast the updated float background back to u8 for comparison
+        let bg_u8 = *p_bg as u8;
         
-        // FIX: Removed the '*' because diff is already a number
+        // Calculate absolute difference manually
+        let diff = if *p_curr > bg_u8 { *p_curr - bg_u8 } else { bg_u8 - *p_curr };
+
         if diff > threshold {
             changed_pixels += 1;
         }
@@ -34,6 +46,6 @@ fn calculate_motion_score(
 
 #[pymodule]
 fn surveillance_core(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(calculate_motion_score, m)?)?;
+    m.add_function(wrap_pyfunction!(update_and_score, m)?)?;
     Ok(())
 }
