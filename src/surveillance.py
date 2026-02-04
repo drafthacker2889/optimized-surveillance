@@ -155,7 +155,7 @@ class SurveillanceSystem:
 
                 if self.avg_frame is None:
                     print("[INFO] Starting background model...")
-                    self.avg_frame = gray.astype("float")
+                    self.avg_frame = gray.astype("float32")
                     continue
 
                 # --- LEVEL 6: KERNEL FUSION (Rust Engine) ---
@@ -170,7 +170,7 @@ class SurveillanceSystem:
                 # 1. Light Suppression
                 if change_percentage > LIGHT_CHANGE_THRESHOLD:
                     print(f"[INFO] Light change ({change_percentage:.1f}%). Resetting model.")
-                    self.avg_frame = gray.astype("float")
+                    self.avg_frame = gray.astype("float32")
                     if self.recording:
                         self.stop_recording()
                     continue
